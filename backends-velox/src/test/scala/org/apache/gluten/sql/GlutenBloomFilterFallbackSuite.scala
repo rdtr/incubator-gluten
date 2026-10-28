@@ -18,35 +18,42 @@ package org.apache.gluten.sql
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.execution.{FilterExecTransformerBase, WholeStageTransformerSuite}
-import org.apache.gluten.expression.VeloxBloomFilterMightContain
-import org.apache.gluten.expression.aggregate.VeloxBloomFilterAggregate
+import org.apache.gluten.execution.{FilterExecTransformerBase, HashAggregateExecBaseTransformer, WholeStageTransformerSuite}
+import org.apache.gluten.expression.{VanillaBloomFilterMightContain, VeloxBloomFilterMightContain}
+import org.apache.gluten.expression.aggregate.{VanillaBloomFilterAggregate, VeloxBloomFilterAggregate}
 
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.catalyst.FunctionIdentifier
-import org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain
+import org.apache.spark.sql.catalyst.expressions.{BloomFilterMightContain, Expression}
 import org.apache.spark.sql.catalyst.expressions.ExpressionInfo
-import org.apache.spark.sql.catalyst.expressions.aggregate.BloomFilterAggregate
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateFunction, BloomFilterAggregate}
 import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, ObjectHashAggregateExec}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.sketch.BloomFilter
+
+import java.io.ByteArrayInputStream
 
 /**
- * Regression tests for https://github.com/apache/gluten/issues/12013.
+ * Regression tests for https://github.com/apache/gluten/issues/12013 and GLUTEN-13489.
  *
  * Verifies that the bloom-filter producer (`bloom_filter_agg`) and consumer (`might_contain`)
  * always stay on a consistent serialized byte format.
  *
- * `BloomFilterMightContainJointRewriteRule` rewrites both sides unconditionally, so they agree by
- * construction. The fix for GLUTEN-12013 is that the rule is registered at `injectPre` instead of
- * `injectPreTransform`: `injectPre` runs before `HeuristicApplier` captures the plan that
- * `ExpandFallbackPolicy` reverts to, so a whole-stage fallback can no longer strip the rewrite from
- * one stage and leave it mismatched against another. Covered here:
+ * `RewriteBloomFilterPairs` decides on the logical plan which user-written pairs are offloaded and
+ * turns everything else into the vanilla markers, so producer and consumer agree by construction.
+ * `BloomFilterMightContainJointRewriteRule` then rewrites the runtime filters that
+ * `InjectRuntimeFilter` adds later; it is registered at `injectPre` (GLUTEN-12013) so that it runs
+ * before `HeuristicApplier` captures the plan that `ExpandFallbackPolicy` reverts to, and a
+ * whole-stage fallback can no longer strip the rewrite from one stage and leave it mismatched
+ * against another. Covered here:
  *   - user-facing pairs across whole-stage fallback of one or both stages;
  *   - literal-valued pairs (SPARK-54336);
  *   - runtime-filter pairs injected by `InjectRuntimeFilter`, which must offload natively and
  *     survive whole-stage reversion of a single stage;
- *   - `DataFrame.stat.bloomFilter()`, which must keep Spark-native bytes (the rule is skipped for
- *     it via `CallerInfo.isBloomFilterStatFunction`).
+ *   - `DataFrame.stat.bloomFilter()` and any other build-only `bloom_filter_agg`, which must keep
+ *     Spark-native bytes;
+ *   - inputs Velox cannot take as they are (int/short/byte, nullable, string), Spark-format
+ *     constants, stored filters, and several pairs in one query (GLUTEN-13489).
  */
 class GlutenBloomFilterFallbackSuite extends WholeStageTransformerSuite {
   protected val resourcePath: String = null
@@ -56,6 +63,7 @@ class GlutenBloomFilterFallbackSuite extends WholeStageTransformerSuite {
 
   private val funcIdBloomFilterAgg = FunctionIdentifier("bloom_filter_agg")
   private val funcIdMightContain = FunctionIdentifier("might_contain")
+  private val funcIdVeloxBloomFilterAgg = FunctionIdentifier("velox_bloom_filter_agg")
 
   // GLUTEN-13179: Spark 4.2's FunctionRegistry rejects the 1-part FunctionIdentifiers registered
   // in beforeAll (they must be fully qualified), which aborts the suite. Ignore every test on
@@ -89,11 +97,18 @@ class GlutenBloomFilterFallbackSuite extends WholeStageTransformerSuite {
       funcIdMightContain,
       new ExpressionInfo(classOf[BloomFilterMightContain].getName, "might_contain"),
       args => BloomFilterMightContain(args(0), args(1)))
+    // Used to build Velox-format bytes for the constant-input test.
+    spark.sessionState.functionRegistry.registerFunction(
+      funcIdVeloxBloomFilterAgg,
+      new ExpressionInfo(classOf[VeloxBloomFilterAggregate].getName, "velox_bloom_filter_agg"),
+      args => VeloxBloomFilterAggregate(args(0), args(1), args(2), 0, 0)
+    )
   }
 
   override def afterAll(): Unit = {
     spark.sessionState.functionRegistry.dropFunction(funcIdBloomFilterAgg)
     spark.sessionState.functionRegistry.dropFunction(funcIdMightContain)
+    spark.sessionState.functionRegistry.dropFunction(funcIdVeloxBloomFilterAgg)
     super.afterAll()
   }
 
@@ -484,6 +499,259 @@ class GlutenBloomFilterFallbackSuite extends WholeStageTransformerSuite {
           checkAnswer(df, Row(true))
         }
       }
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // GLUTEN-13489: bloom filters that cannot be offloaded as they are.
+  //
+  // Vanilla Spark accepts byte/short/int/long/string inputs and ignores nulls, while Velox's
+  // bloom_filter_agg takes non-null bigint only and its bytes are not Spark's format. The logical
+  // rule RewriteBloomFilterPairs decides per producer/consumer pair: cast small integers, filter
+  // nulls, and keep everything else (string input, build-only aggregates, Spark-format constants,
+  // stored filters) on the vanilla markers so the bytes stay in Spark's format.
+  // ---------------------------------------------------------------------------------------------
+
+  private val edgeTable = "bloom_filter_edge_test"
+
+  private def withEdgeTable(f: => Unit): Unit = {
+    withTempView(edgeTable) {
+      // ncol is null for even values. Columns from Scala primitives are not nullable, ncol is.
+      (1 to 100)
+        .map(
+          i =>
+            (
+              i.toLong,
+              i,
+              i.toShort,
+              i.toByte,
+              s"s$i",
+              if (i % 2 == 0) None else Some(i.toLong)))
+        .toDF("lcol", "icol", "scol", "bcol", "str", "ncol")
+        .createOrReplaceTempView(edgeTable)
+      f
+    }
+  }
+
+  /** The aggregate functions of every aggregate in the executed plan, native or JVM. */
+  private def aggregateFunctions(df: DataFrame): Seq[AggregateFunction] = {
+    collectWithSubqueries(df.queryExecution.executedPlan) {
+      case a: BaseAggregateExec => a.aggregateExpressions.map(_.aggregateFunction)
+    }.flatten
+  }
+
+  /** Every expression in the executed plan matching `f`, including inside subqueries. */
+  private def collectExpressions[T](df: DataFrame)(f: PartialFunction[Expression, T]): Seq[T] = {
+    collectWithSubqueries(df.queryExecution.executedPlan) {
+      case p => p.expressions.flatMap(_.collect(f))
+    }.flatten
+  }
+
+  private def hasNativeAggregate(df: DataFrame): Boolean = {
+    collectWithSubqueries(df.queryExecution.executedPlan) {
+      case a: HashAggregateExecBaseTransformer => a
+    }.nonEmpty
+  }
+
+  /** The rows vanilla Spark returns for `sql`, i.e. with the native bloom filter switched off. */
+  private def vanillaRows(sql: String): Seq[Row] = {
+    var rows: Seq[Row] = null
+    withSQLConf(GlutenConfig.COLUMNAR_NATIVE_BLOOMFILTER_ENABLED.key -> "false") {
+      rows = spark.sql(sql).collect().toSeq
+    }
+    rows
+  }
+
+  private def assertOffloadedPair(df: DataFrame): Unit = {
+    val aggs = aggregateFunctions(df)
+    assert(
+      aggs.exists(_.isInstanceOf[VeloxBloomFilterAggregate]) &&
+        !aggs.exists(_.isInstanceOf[BloomFilterAggregate]) &&
+        !aggs.exists(_.isInstanceOf[VanillaBloomFilterAggregate]),
+      s"Expected only VeloxBloomFilterAggregate, got ${aggs.map(_.getClass.getSimpleName)}. " +
+        s"Plan:\n${df.queryExecution.executedPlan}"
+    )
+    assert(
+      hasNativeAggregate(df),
+      s"Expected the bloom_filter_agg to run natively. Plan:\n${df.queryExecution.executedPlan}")
+    assert(
+      collectExpressions(df) { case m: VeloxBloomFilterMightContain => m }.nonEmpty &&
+        collectExpressions(df) { case m: VanillaBloomFilterMightContain => m }.isEmpty,
+      s"Expected velox_might_contain only. Plan:\n${df.queryExecution.executedPlan}"
+    )
+  }
+
+  private def assertVanillaPair(df: DataFrame): Unit = {
+    val aggs = aggregateFunctions(df)
+    assert(
+      aggs.exists(_.isInstanceOf[VanillaBloomFilterAggregate]) &&
+        !aggs.exists(_.isInstanceOf[VeloxBloomFilterAggregate]),
+      s"Expected only VanillaBloomFilterAggregate, got ${aggs.map(_.getClass.getSimpleName)}. " +
+        s"Plan:\n${df.queryExecution.executedPlan}"
+    )
+    assertVanillaConsumer(df)
+  }
+
+  private def assertVanillaConsumer(df: DataFrame): Unit = {
+    assert(
+      collectExpressions(df) { case m: VanillaBloomFilterMightContain => m }.nonEmpty &&
+        collectExpressions(df) { case m: VeloxBloomFilterMightContain => m }.isEmpty,
+      s"Expected the vanilla might_contain only. Plan:\n${df.queryExecution.executedPlan}"
+    )
+  }
+
+  test("GLUTEN-13489: int, short and byte inputs are cast to bigint and offloaded") {
+    withEdgeTable {
+      Seq("icol", "scol", "bcol").foreach {
+        col =>
+          val sql =
+            s"""
+               |SELECT lcol FROM $edgeTable
+               |WHERE might_contain(
+               |  (SELECT bloom_filter_agg($col, 1000L, 8192L) FROM $edgeTable), cast($col as long))
+               |""".stripMargin
+          val df = spark.sql(sql)
+          // Every inserted value is found: no false negatives.
+          assert(
+            df.collect().length == 100,
+            s"$col: expected all rows. Plan:\n${df.queryExecution.executedPlan}")
+          assertOffloadedPair(df)
+      }
+    }
+  }
+
+  test("GLUTEN-13489: nullable input is offloaded with nulls filtered out") {
+    withEdgeTable {
+      val sql =
+        s"""
+           |SELECT lcol FROM $edgeTable
+           |WHERE might_contain((SELECT bloom_filter_agg(ncol, 1000L, 8192L) FROM $edgeTable), lcol)
+           |""".stripMargin
+      val df = spark.sql(sql)
+      // Must not throw "First argument of bloom_filter_agg cannot be null"; the 50 odd values
+      // are found, even values are only false positives, exactly as in vanilla Spark.
+      val rows = df.collect().toSeq.sortBy(_.getLong(0))
+      assert(rows.size >= 50 && (1L to 99L by 2).forall(v => rows.exists(_.getLong(0) == v)))
+      assert(
+        rows == vanillaRows(sql).sortBy(_.getLong(0)),
+        s"Native and vanilla results differ. Plan:\n${df.queryExecution.executedPlan}")
+      assertOffloadedPair(df)
+    }
+  }
+
+  test("GLUTEN-13489: string input stays vanilla") {
+    withEdgeTable {
+      // Must not throw UnsupportedOperationException from VeloxBloomFilter.putBinary.
+      val buildOnly = s"SELECT bloom_filter_agg(str, 1000L, 8192L) AS bf FROM $edgeTable"
+      val buildDf = spark.sql(buildOnly)
+      val bytes = buildDf.collect().head.getAs[Array[Byte]]("bf")
+      assert(bytes.toSeq == vanillaRows(buildOnly).head.getAs[Array[Byte]]("bf").toSeq)
+      assert(aggregateFunctions(buildDf).exists(_.isInstanceOf[VanillaBloomFilterAggregate]))
+
+      val paired =
+        s"""
+           |SELECT lcol FROM $edgeTable
+           |WHERE might_contain((SELECT bloom_filter_agg(str, 1000L, 8192L) FROM $edgeTable), lcol)
+           |""".stripMargin
+      val df = spark.sql(paired)
+      assert(df.collect().toSeq.sortBy(_.getLong(0)) == vanillaRows(paired).sortBy(_.getLong(0)))
+      assertVanillaPair(df)
+    }
+  }
+
+  test("GLUTEN-13489: build-only bloom_filter_agg produces Spark-readable bytes") {
+    withEdgeTable {
+      val df = spark.sql(s"SELECT bloom_filter_agg(lcol, 1000L, 8192L) AS bf FROM $edgeTable")
+      val bytes = df.collect().head.getAs[Array[Byte]]("bf")
+      // Must not throw: java.io.IOException: Unexpected Bloom filter version number.
+      val bf = BloomFilter.readFrom(new ByteArrayInputStream(bytes))
+      assert((1L to 100L).forall(bf.mightContainLong), "Expected every inserted value present")
+      assert(
+        aggregateFunctions(df).exists(_.isInstanceOf[VanillaBloomFilterAggregate]) &&
+          !aggregateFunctions(df).exists(_.isInstanceOf[VeloxBloomFilterAggregate]),
+        "A bloom_filter_agg without a consumer must stay vanilla. " +
+          s"Plan:\n${df.queryExecution.executedPlan}"
+      )
+    }
+  }
+
+  test("GLUTEN-13489: constant bloom filter is offloaded only when it is Velox-format") {
+    withEdgeTable {
+      def hex(bytes: Array[Byte]): String = bytes.map("%02x".format(_)).mkString
+      // Spark-format bytes, as a user would pass from BloomFilter.create().
+      val sparkBf = BloomFilter.create(1000L, 8192L)
+      (1L to 100L).foreach(sparkBf.putLong)
+      val sparkHex = hex(BloomFilterAggregate.serialize(sparkBf))
+      val sparkSql =
+        s"SELECT lcol FROM $edgeTable WHERE might_contain(unhex('$sparkHex'), lcol)"
+      val sparkDf = spark.sql(sparkSql)
+      // Must not throw "Unsupported BloomFilter version: 0".
+      assert(sparkDf.collect().toSeq == vanillaRows(sparkSql))
+      assertVanillaConsumer(sparkDf)
+
+      // Velox-format bytes, e.g. a filter built by the native aggregate and stored by the user.
+      val veloxBytes = spark
+        .sql(s"SELECT velox_bloom_filter_agg(lcol, 1000L, 8192L) AS bf FROM $edgeTable")
+        .collect()
+        .head
+        .getAs[Array[Byte]]("bf")
+      val veloxDf = spark.sql(
+        s"SELECT lcol FROM $edgeTable WHERE might_contain(unhex('${hex(veloxBytes)}'), lcol)")
+      assert(veloxDf.collect().length == 100)
+      assert(
+        collectExpressions(veloxDf) { case m: VeloxBloomFilterMightContain => m }.nonEmpty,
+        "Expected velox_might_contain for Velox-format bytes. " +
+          s"Plan:\n${veloxDf.queryExecution.executedPlan}"
+      )
+    }
+  }
+
+  test("GLUTEN-13489: a subquery reading a stored bloom filter stays vanilla") {
+    withEdgeTable {
+      withTempView("stored_bf") {
+        // Build the filter in one query and store its (Spark-format) bytes.
+        val bytes = spark
+          .sql(s"SELECT bloom_filter_agg(lcol, 1000L, 8192L) AS bf FROM $edgeTable")
+          .collect()
+          .head
+          .getAs[Array[Byte]]("bf")
+        Seq(bytes).toDF("bf").createOrReplaceTempView("stored_bf")
+        val sql =
+          s"SELECT lcol FROM $edgeTable WHERE might_contain((SELECT bf FROM stored_bf), lcol)"
+        val df = spark.sql(sql)
+        // Must not throw "Unsupported BloomFilter version: 0".
+        assert(df.collect().length == 100)
+        assertVanillaConsumer(df)
+      }
+    }
+  }
+
+  test("GLUTEN-13489: each producer/consumer pair in a query is decided on its own") {
+    withEdgeTable {
+      val sql =
+        s"""
+           |SELECT lcol FROM $edgeTable
+           |WHERE might_contain((SELECT bloom_filter_agg(lcol, 1000L, 8192L) FROM $edgeTable), lcol)
+           |  AND might_contain((SELECT bloom_filter_agg(icol, 1000L, 8192L) FROM $edgeTable), lcol)
+           |  AND NOT might_contain(
+           |    (SELECT bloom_filter_agg(str, 1000L, 8192L) FROM $edgeTable WHERE lcol > 50), lcol)
+           |""".stripMargin
+      val df = spark.sql(sql)
+      assert(df.collect().toSeq.sortBy(_.getLong(0)) == vanillaRows(sql).sortBy(_.getLong(0)))
+      val aggs = aggregateFunctions(df)
+      assert(
+        aggs.count(_.isInstanceOf[VeloxBloomFilterAggregate]) >= 2 &&
+          aggs.exists(_.isInstanceOf[VanillaBloomFilterAggregate]) &&
+          !aggs.exists(_.isInstanceOf[BloomFilterAggregate]),
+        "Expected two Velox and one vanilla aggregate, got " +
+          s"${aggs.map(_.getClass.getSimpleName)}. Plan:\n${df.queryExecution.executedPlan}"
+      )
+      assert(
+        collectExpressions(df) { case m: VeloxBloomFilterMightContain => m }.size == 2 &&
+          collectExpressions(df) { case m: VanillaBloomFilterMightContain => m }.size == 1,
+        "Expected two velox_might_contain and one vanilla. " +
+          s"Plan:\n${df.queryExecution.executedPlan}"
+      )
     }
   }
 }

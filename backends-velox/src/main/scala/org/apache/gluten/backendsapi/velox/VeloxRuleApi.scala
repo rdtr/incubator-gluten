@@ -59,6 +59,10 @@ object VeloxRuleApi {
     injector.injectOptimizerRule(RewriteCastFromArray.apply)
     injector.injectOptimizerRule(RewriteUnboundedWindow.apply)
     injector.injectOptimizerRule(PushAggregateThroughJoinBatch.apply)
+    // Pre-CBO so that user-written bloom_filter_agg / might_contain pairs are decided while both
+    // sides are visible, before InjectRuntimeFilter and MergeScalarSubqueries run and before AQE
+    // compiles each subquery into its own query stage.
+    injector.injectPreCBORule(RewriteBloomFilterPairs.apply)
     injector.injectPlannerStrategy(ImplementJoinAggregate.apply)
 
     if (!BackendsApiManager.getSettings.enableJoinKeysRewrite()) {
@@ -85,11 +89,7 @@ object VeloxRuleApi {
     // by that reversion, which can leave a vanilla-reverted stage producing Spark-format bloom
     // filter bytes while another stage still consumes them as Velox-format, crashing with
     // "Unsupported BloomFilter version".
-    injector.injectPre(
-      c =>
-        BloomFilterMightContainJointRewriteRule.apply(
-          c.session,
-          c.caller.isBloomFilterStatFunction()))
+    injector.injectPre(c => BloomFilterMightContainJointRewriteRule.apply(c.session))
 
     // Legacy: Pre-transform rules.
     injector.injectPreTransform(_ => RemoveTransitions)

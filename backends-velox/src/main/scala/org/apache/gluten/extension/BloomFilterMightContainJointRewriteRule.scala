@@ -26,12 +26,19 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{BloomFilterAggregate
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
 
-case class BloomFilterMightContainJointRewriteRule(
-    spark: SparkSession,
-    isBloomFilterStatFunction: Boolean)
-  extends Rule[SparkPlan] {
+/**
+ * Offloads the runtime bloom filters that Spark's `InjectRuntimeFilter` adds to a plan.
+ *
+ * User-written `bloom_filter_agg` / `might_contain` are decided by [[RewriteBloomFilterPairs]] on
+ * the logical plan, which leaves none of them as Spark's `BloomFilterAggregate` /
+ * `BloomFilterMightContain`. The only ones that still carry Spark's classes here are the runtime
+ * filters, which `InjectRuntimeFilter` injects after that rule ran. They always come as a
+ * `bloom_filter_agg(xxhash64(...))` subquery consumed by `might_contain(..., xxhash64(...))`, so
+ * both sides can be rewritten unconditionally and still agree on the byte format.
+ */
+case class BloomFilterMightContainJointRewriteRule(spark: SparkSession) extends Rule[SparkPlan] {
   override def apply(plan: SparkPlan): SparkPlan = {
-    if (isBloomFilterStatFunction || !GlutenConfig.get.enableNativeBloomFilter) {
+    if (!GlutenConfig.get.enableNativeBloomFilter) {
       return plan
     }
     val out = plan.transformWithSubqueries {

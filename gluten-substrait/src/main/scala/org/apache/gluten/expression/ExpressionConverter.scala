@@ -632,7 +632,7 @@ object ExpressionConverter extends SQLConfHelper with Logging {
           substraitExprName,
           Seq(
             replaceWithExpressionTransformer0(r.left, attributeSeq, expressionsMap),
-            withRewrittenRegexPattern(r.right, attributeSeq, expressionsMap)
+            withRewrittenRegexPattern(r.right, attributeSeq, expressionsMap, matchOnly = true)
           ),
           r
         )
@@ -1024,8 +1024,10 @@ object ExpressionConverter extends SQLConfHelper with Logging {
   private def withRewrittenRegexPattern(
       patternChild: Expression,
       attributeSeq: Seq[Attribute],
-      expressionsMap: Map[Class[_], String]): ExpressionTransformer = {
-    BackendsApiManager.getSparkPlanExecApiInstance.rewriteRegexPattern(patternChild) match {
+      expressionsMap: Map[Class[_], String],
+      matchOnly: Boolean = false): ExpressionTransformer = {
+    val api = BackendsApiManager.getSparkPlanExecApiInstance
+    api.rewriteRegexPattern(patternChild, matchOnly) match {
       case l: Literal => LiteralTransformer(l)
       case other => replaceWithExpressionTransformer0(other, attributeSeq, expressionsMap)
     }

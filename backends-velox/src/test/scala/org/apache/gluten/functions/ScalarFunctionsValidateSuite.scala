@@ -890,10 +890,17 @@ class ScalarFunctionsValidateSuite extends FunctionsValidateSuite {
         checkOffloaded(s"rlike(s, ${lit("a\\$")})")
         checkOffloaded(s"rlike(s, ${lit("\\Qa.b\\E")})")
 
-        // `$` also matches before a final line terminator in Java.
-        checkFallback(s"rlike(s, ${lit("b$")})")
+        // `$` also matches before a final line terminator in Java. rlike only asks whether there
+        // is a match, so `$` is rewritten there. The other functions return the match position.
+        checkOffloaded(s"rlike(s, ${lit("b$")})")
+        checkOffloaded(s"rlike(s, ${lit("^a.?b$")})")
+        checkOffloaded(s"rlike(s, ${lit("x|(b$)")})")
+        checkFallback(s"rlike(s, ${lit("b$\\n")})")
+        checkFallback(s"rlike(s, ${lit("\\r$")})")
+        checkFallback(s"rlike(s, ${lit("[^a]$")})")
         checkFallback(s"regexp_replace(s, ${lit("b$")}, 'X')")
         checkFallback(s"regexp_extract(s, ${lit("(b)$")}, 1)")
+        checkFallback(s"split(s, ${lit("b$")})")
         // Inline flags that mean something else in RE2.
         checkFallback(s"rlike(s, ${lit("(?m)^b")})")
         // scalastyle:off nonascii

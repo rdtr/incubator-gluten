@@ -389,9 +389,10 @@ trait SparkPlanExecApi {
    * plan. Backends whose native engine does not use Java regex syntax (e.g. RE2 in Velox and Bolt)
    * override this to translate the pattern, and throw [[GlutenNotSupportException]] for patterns
    * they cannot express so that the expression falls back to Spark. The default leaves the pattern
-   * unchanged.
+   * unchanged. `matchOnly` is true when the caller only asks whether the pattern matches (`rlike`),
+   * not where.
    */
-  def rewriteRegexPattern(pattern: Expression): Expression = pattern
+  def rewriteRegexPattern(pattern: Expression, matchOnly: Boolean): Expression = pattern
 
   def genRegexpReplaceTransformer(
       substraitExprName: String,

@@ -239,6 +239,88 @@ class Re2PatternUtilsSuite extends AnyFunSuite {
     // scalastyle:on nonascii
   }
 
+  private val dollar = "(?:\\r\\n|[\\n\\r\\x{85}\\x{2028}\\x{2029}])?\\z"
+
+  private def trMatch(p: String): Either[String, String] =
+    Re2PatternUtils.convertJavaPatternToRe2(p, matchOnly = true)
+
+  /** Inputs around the final line terminators that Java's `$` accepts. */
+  // scalastyle:off nonascii
+  private val dollarInputs = inputs ++ Seq(
+    "b",
+    "ba",
+    "ab\n",
+    "ab\r\n",
+    "ab\r",
+    "ab\u0085",
+    "ab\u2028",
+    "ab\u2029",
+    "ab\n\n",
+    "ab\r\n\n",
+    "ab\n\r",
+    "\r\n",
+    "\n")
+  // scalastyle:on nonascii
+
+  test("$ is rewritten for match-only callers") {
+    Seq(
+      "b$" -> s"b$dollar",
+      "$" -> dollar,
+      "^\\w+$" -> s"^\\w+$dollar",
+      "a.?b$" -> s"a$dot?b$dollar",
+      "a$|b$" -> s"a$dollar|b$dollar",
+      "x|(b$)" -> s"x|(b$dollar)",
+      "(b$|a)" -> s"(b$dollar|a)",
+      "(b$)+" -> s"(b$dollar)+",
+      "(?:b$)?" -> s"(?:b$dollar)?",
+      "[^\\r]$" -> s"[^\\r]$dollar",
+      "\\P{Cc}$" -> s"\\P{Cc}$dollar",
+      "[\\u4e00-\\u9fa5]{2,10}[0-9]+$" -> s"[\\x{4e00}-\\x{9fa5}]{2,10}[0-9]+$dollar"
+    ).foreach {
+      case (pattern, expected) =>
+        assert(trMatch(pattern) == Right(expected), s"pattern: $pattern")
+        dollarInputs.foreach {
+          s =>
+            assert(
+              Pattern.compile(pattern).matcher(s).find() ==
+                Pattern.compile(expected).matcher(s).find(),
+              s"pattern: $pattern, input: $s")
+        }
+        assert(trMatch(expected) == Right(expected), s"translating again changed $expected")
+        assert(tr(pattern).isEmpty, s"pattern: $pattern")
+    }
+  }
+
+  test("$ is rejected where the rewrite would change the result") {
+    // Something after `$` consumes input.
+    Seq("b$\\n", "b$.", "(b$|a)c", "(b$)*c", "b$\\z", "b$^").foreach {
+      p => assert(trMatch(p).left.exists(_.contains("followed by more pattern")), s"pattern: $p")
+    }
+    // An element can consume the `\r` of a final `\r\n`.
+    Seq(
+      "\\r$",
+      "\\x0D$",
+      "\\x{d}$",
+      "\\u000D$",
+      "\r$",
+      "\\s$",
+      "\\W$",
+      "\\D$",
+      "[^a]$",
+      "[\\x00-\\x1F]$",
+      "[\\s]$",
+      "\\p{Cc}$",
+      "\\P{L}$",
+      "(?s).$",
+      "\\Q\r\\E$"
+    ).foreach {
+      p => assert(trMatch(p).left.exists(_.contains("can match `\\r`")), s"pattern: $p")
+      // Java's `$` does not match between `\r` and `\n`, so the rewrite would be wrong here.
+    }
+    assert(Pattern.compile("\\r$").matcher("ab\r\n").find() == false)
+    assert(Pattern.compile(s"\\r$dollar").matcher("ab\r\n").find())
+  }
+
   test("rewrites combine with unicode escapes") {
     assertTranslated(
       "^(\\d+)\\s*.(?s:.)[\\s.]\\u0041",

@@ -35,11 +35,12 @@ object Re2PatternUtils {
    * Implements [[org.apache.gluten.backendsapi.SparkPlanExecApi#rewriteRegexPattern]] for RE2
    * backends. A string literal pattern is translated to RE2 syntax; patterns with constructs that
    * RE2 cannot express with the same meaning throw [[GlutenNotSupportException]] to trigger
-   * fallback. Non-literal patterns are returned unchanged.
+   * fallback. Non-literal patterns are returned unchanged. See [[convertJavaPatternToRe2]] for
+   * `matchOnly`.
    */
-  def rewriteRegexPattern(pattern: Expression): Expression = pattern match {
+  def rewriteRegexPattern(pattern: Expression, matchOnly: Boolean): Expression = pattern match {
     case Literal(p: UTF8String, StringType) =>
-      convertJavaPatternToRe2(p.toString) match {
+      convertJavaPatternToRe2(p.toString, matchOnly) match {
         case Right(translated) => Literal(UTF8String.fromString(translated), StringType)
         case Left(reason) =>
           throw new GlutenNotSupportException(
@@ -108,9 +109,14 @@ object Re2PatternUtils {
    *     tab, RE2's does not.
    *   - Escaped characters, escapes that mean the same in both engines, and `\Q...\E` are copied
    *     verbatim. A `.` or `$` inside a character class is a literal and is copied.
+   *   - With `matchOnly`, `$` becomes `(?:\r\n|[\n\r\x{85}\x{2028}\x{2029}])?\z`. Java's `$` also
+   *     matches before a final line terminator; consuming that terminator instead gives the same
+   *     answer to whether there is a match, but not the same match position. The rewrite is used
+   *     only when nothing after the `$` consumes input and no element of the pattern can consume
+   *     `\r`, since Java's `$` does not match between `\r` and `\n`.
    *
    * Rejected constructs:
-   *   - `$`: Java also matches before a final line terminator.
+   *   - `$` without `matchOnly`, or where the rewrite above does not apply.
    *   - Inline flags other than `s`: `(?i)` is ASCII-only in Java, `(?m)` knows more line
    *     terminators in Java, `(?U)` means Unicode classes in Java and ungreedy in RE2.
    *   - `\b`, `\B`: Java treats non-ASCII letters as word characters before JDK 19.
@@ -122,11 +128,19 @@ object Re2PatternUtils {
    *   - Nested character classes and `&&`: unions and intersections in Java, literals in RE2.
    *   - Lookaround, atomic groups and any escape or construct not listed above.
    */
-  def convertJavaPatternToRe2(pattern: String): Either[String, String] =
-    new Re2Converter(pattern).run()
+  def convertJavaPatternToRe2(
+      pattern: String,
+      matchOnly: Boolean = false): Either[String, String] =
+    new Re2Converter(pattern, matchOnly).run()
 
   /** Java's `.` without DOTALL: anything except the line terminators. */
   private val Re2Dot = "[^\\n\\r\\x{85}\\x{2028}\\x{2029}]"
+
+  /**
+   * Java's `$` without MULTILINE for a caller that only asks whether there is a match: an optional
+   * final line terminator, then the end of the input.
+   */
+  private val Re2Dollar = "(?:\\r\\n|[\\n\\r\\x{85}\\x{2028}\\x{2029}])?\\z"
 
   /** Java's `\s` without UNICODE_CHARACTER_CLASS: `[ \t\n\x0B\f\r]` (RE2 lacks `\x0B`). */
   private val SpaceChars = "\\t\\n\\x0B\\f\\r "
@@ -136,18 +150,34 @@ object Re2PatternUtils {
     ("L Lu Ll Lt Lm Lo M Mn Mc Me N Nd Nl No P Pc Pd Ps Pe Pi Pf Po S Sm Sc Sk So Z Zs Zl Zp " +
       "C Cc Cf Co Cs").split(' ').toSet
 
-  /** Escapes followed by one letter that mean the same in both engines. */
-  private val SameLetterEscapes = Set('d', 'D', 'w', 'W', 't', 'n', 'r', 'f', 'a')
+  /** The general categories that contain `\r`. */
+  private val CrCategories = Set("C", "Cc")
+
+  /** Single-character escapes that mean the same in both engines, with their code points. */
+  private val CharEscapes = Map('t' -> 0x09, 'n' -> 0x0a, 'r' -> 0x0d, 'f' -> 0x0c, 'a' -> 0x07)
 
   final private class Unsupported(val reason: String) extends Exception(reason)
 
-  final private class Re2Converter(p: String) {
+  /**
+   * What an escape or a class member matches: one code point, or a set of characters (`codePoint`
+   * is -1), and whether that can be `\r`.
+   */
+  final private case class Atom(codePoint: Int, matchesCr: Boolean)
+
+  private def charAtom(cp: Int): Atom = Atom(cp, cp == '\r')
+
+  final private class Re2Converter(p: String, matchOnly: Boolean) {
     private val out = new java.lang.StringBuilder(p.length)
     private var i = 0
     // DOTALL state of the current group and of the enclosing groups. Java and RE2 both restore
     // inline flags at the end of a group.
     private var dotAll = false
     private var enclosingDotAll: List[Boolean] = Nil
+    // For the `$` rewrite: one token per pattern element ('c' consumes input, 'a' is another
+    // zero-width assertion, '$', '(', ')', '|', and 'q' for a quantifier), and whether any
+    // element can consume `\r`.
+    private val tokens = new StringBuilder
+    private var canMatchCr = false
 
     private def fail(reason: String): Nothing = throw new Unsupported(reason)
 
@@ -155,29 +185,85 @@ object Re2PatternUtils {
       try {
         while (i < p.length) {
           p.charAt(i) match {
-            case '\\' => escape(inClass = false)
-            case '[' => charClass()
+            case '\\' =>
+              val zeroWidth = i + 1 < p.length && (p.charAt(i + 1) == 'A' || p.charAt(i + 1) == 'z')
+              val atom = escape(inClass = false)
+              tokens.append(if (zeroWidth) 'a' else 'c')
+              canMatchCr |= atom.matchesCr
+            case '[' =>
+              canMatchCr |= charClass()
+              tokens.append('c')
             case '.' =>
               out.append(if (dotAll) "." else Re2Dot)
+              canMatchCr |= dotAll
+              tokens.append('c')
               i += 1
-            case '$' => fail("`$` also matches before a final line terminator in Java")
+            case '$' =>
+              if (!matchOnly) fail("`$` also matches before a final line terminator in Java")
+              out.append(Re2Dollar)
+              tokens.append('$')
+              i += 1
             case '(' => group()
             case ')' =>
               if (enclosingDotAll.isEmpty) fail("unbalanced `)`")
               dotAll = enclosingDotAll.head
               enclosingDotAll = enclosingDotAll.tail
-              out.append(')')
-              i += 1
-            case '{' => repetition()
-            case c =>
-              out.append(c)
-              i += 1
+              tokens.append(')')
+              copy(1)
+            case '{' =>
+              repetition()
+              tokens.append('q')
+            case '*' | '+' | '?' =>
+              tokens.append('q')
+              copy(1)
+            case '|' =>
+              tokens.append('|')
+              copy(1)
+            case '^' =>
+              tokens.append('a')
+              copy(1)
+            case _ =>
+              val cp = p.codePointAt(i)
+              canMatchCr |= cp == '\r'
+              tokens.append('c')
+              copy(Character.charCount(cp))
           }
         }
         if (enclosingDotAll.nonEmpty) fail("unbalanced `(`")
+        checkDollars()
         Right(out.toString)
       } catch {
         case e: Unsupported => Left(e.reason)
+      }
+    }
+
+    /**
+     * The rewritten `$` consumes the final line terminator, so it is only correct when nothing
+     * after it consumes input. Java's `$` also does not match between `\r` and `\n`, which the
+     * rewrite would, so no element of the pattern may consume `\r`.
+     */
+    private def checkDollars(): Unit = {
+      val n = tokens.length
+      for (k <- 0 until n if tokens.charAt(k) == '$') {
+        var j = k + 1
+        while (j < n) {
+          tokens.charAt(j) match {
+            case ')' | 'q' | '$' => j += 1
+            case '|' =>
+              // Skip the other alternatives of the current group.
+              var depth = 0
+              j += 1
+              while (j < n && !(tokens.charAt(j) == ')' && depth == 0)) {
+                if (tokens.charAt(j) == '(') depth += 1
+                if (tokens.charAt(j) == ')') depth -= 1
+                j += 1
+              }
+            case _ => fail("`$` that is followed by more pattern is not supported")
+          }
+        }
+      }
+      if (tokens.indexOf("$") >= 0 && canMatchCr) {
+        fail("`$` in a pattern that can match `\\r` is not supported")
       }
     }
 
@@ -187,20 +273,32 @@ object Re2PatternUtils {
     }
 
     /** Handles the escape at `i`, which is a backslash. */
-    private def escape(inClass: Boolean): Unit = {
+    private def escape(inClass: Boolean): Atom = {
       if (i + 1 >= p.length) fail("trailing `\\`")
       val c = p.charAt(i + 1)
       c match {
-        case 'u' => unicodeEscape()
+        case 'u' => charAtom(unicodeEscape())
         case 's' =>
           out.append(if (inClass) SpaceChars else s"[$SpaceChars]")
           i += 2
+          Atom(-1, matchesCr = true)
         case 'S' if !inClass =>
           out.append(s"[^$SpaceChars]")
           i += 2
-        case _ if SameLetterEscapes.contains(c) => copy(2)
-        case 'A' | 'z' if !inClass => copy(2)
-        case 'x' => hexEscape()
+          Atom(-1, matchesCr = false)
+        case 'd' | 'w' =>
+          copy(2)
+          Atom(-1, matchesCr = false)
+        case 'D' | 'W' =>
+          copy(2)
+          Atom(-1, matchesCr = true)
+        case _ if CharEscapes.contains(c) =>
+          copy(2)
+          charAtom(CharEscapes(c))
+        case 'A' | 'z' if !inClass =>
+          copy(2)
+          Atom(-1, matchesCr = false)
+        case 'x' => charAtom(hexEscape())
         case 'p' | 'P' => property()
         case 'Q' if !inClass => quote()
         case 'b' | 'B' if !inClass =>
@@ -211,12 +309,13 @@ object Re2PatternUtils {
         case _ if c < 0x80 && !Character.isLetterOrDigit(c) =>
           // An escaped ASCII punctuation or space character is a literal in both engines.
           copy(2)
+          charAtom(c)
         case _ => fail(s"escape `\\$c` is not known to mean the same in RE2")
       }
     }
 
-    /** A backslash-u escape, or a surrogate pair of them, becomes `\x{XXXX}`. */
-    private def unicodeEscape(): Unit = {
+    /** A backslash-u escape, or a surrogate pair of them, becomes `\x{XXXX}`. Returns its value. */
+    private def unicodeEscape(): Int = {
       val cp = unicodeEscapeAt(p, i)
       if (cp < 0) fail("malformed `\\u` escape")
       if (Character.isHighSurrogate(cp.toChar)) {
@@ -225,33 +324,41 @@ object Re2PatternUtils {
         val full = Character.toCodePoint(cp.toChar, lo.toChar)
         out.append("\\x{").append(Integer.toHexString(full).toUpperCase(Locale.ROOT)).append("}")
         i += 12
+        full
       } else if (Character.isLowSurrogate(cp.toChar)) {
         fail("unpaired surrogate escape")
       } else {
         out.append("\\x{").append(p, i + 2, i + 6).append("}")
         i += 6
+        cp
       }
     }
 
-    /** `\xhh` or `\x{h...}`. */
-    private def hexEscape(): Unit = {
-      if (i + 2 < p.length && p.charAt(i + 2) == '{') {
+    /** `\xhh` or `\x{h...}`. Returns the code point. */
+    private def hexEscape(): Int = {
+      val (digits, length) = if (i + 2 < p.length && p.charAt(i + 2) == '{') {
         val end = p.indexOf('}', i + 3)
-        if (end < 0 || end == i + 3 || !(i + 3 until end).forall(k => isHex(p.charAt(k)))) {
-          fail("malformed `\\x{...}` escape")
-        }
-        copy(end + 1 - i)
+        if (end < 0) fail("malformed `\\x{...}` escape")
+        (p.substring(i + 3, end), end + 1 - i)
       } else {
-        if (i + 4 > p.length || !isHex(p.charAt(i + 2)) || !isHex(p.charAt(i + 3))) {
-          fail("malformed `\\xhh` escape")
-        }
-        copy(4)
+        (p.substring(i + 2, math.min(i + 4, p.length)), 4)
       }
+      if (
+        digits.isEmpty || digits.length > 6 || (length == 4 && digits.length != 2) ||
+        !digits.forall(isHex)
+      ) {
+        fail("malformed `\\x` escape")
+      }
+      val cp = Integer.parseInt(digits, 16)
+      if (cp > Character.MAX_CODE_POINT) fail("`\\x` escape out of range")
+      copy(length)
+      cp
     }
 
     /** `\pX`, `\p{Name}`, `\PX`, `\P{Name}`. */
-    private def property(): Unit = {
+    private def property(): Atom = {
       if (i + 2 >= p.length) fail("malformed `\\p` escape")
+      val negated = p.charAt(i + 1) == 'P'
       val (name, length) = if (p.charAt(i + 2) == '{') {
         val end = p.indexOf('}', i + 3)
         if (end < 0) fail("malformed `\\p{...}` escape")
@@ -263,33 +370,53 @@ object Re2PatternUtils {
         fail(s"property `$name` is not known to mean the same in RE2")
       }
       copy(length)
+      Atom(-1, matchesCr = CrCategories.contains(name) != negated)
     }
 
     /** `\Q...\E`: copied as is when the quoted text has no backslash. */
-    private def quote(): Unit = {
+    private def quote(): Atom = {
       val end = p.indexOf("\\E", i + 2)
       if (end < 0) fail("`\\Q` without `\\E`")
       if (p.indexOf('\\', i + 2) < end) fail("backslash inside `\\Q...\\E`")
+      val matchesCr = p.substring(i + 2, end).contains('\r')
       copy(end + 2 - i)
+      Atom(-1, matchesCr)
     }
 
-    /** A character class starting at `i`. */
-    private def charClass(): Unit = {
+    /** One member of a character class at `i`. */
+    private def classMember(): Atom = p.charAt(i) match {
+      case '[' => fail("nested character classes are unions in Java")
+      case '&' if i + 1 < p.length && p.charAt(i + 1) == '&' =>
+        fail("`&&` is a class intersection in Java")
+      case '\\' => escape(inClass = true)
+      case _ =>
+        val cp = p.codePointAt(i)
+        copy(Character.charCount(cp))
+        charAtom(cp)
+    }
+
+    /** A character class starting at `i`. Returns whether it can match `\r`. */
+    private def charClass(): Boolean = {
       copy(1)
-      if (i < p.length && p.charAt(i) == '^') copy(1)
+      val negated = i < p.length && p.charAt(i) == '^'
+      if (negated) copy(1)
+      var containsCr = false
       // A `]` right after `[` or `[^` is a literal in both engines.
       if (i < p.length && p.charAt(i) == ']') copy(1)
       while (i < p.length && p.charAt(i) != ']') {
-        p.charAt(i) match {
-          case '[' => fail("nested character classes are unions in Java")
-          case '&' if i + 1 < p.length && p.charAt(i + 1) == '&' =>
-            fail("`&&` is a class intersection in Java")
-          case '\\' => escape(inClass = true)
-          case _ => copy(1)
+        val lo = classMember()
+        if (i + 1 < p.length && p.charAt(i) == '-' && p.charAt(i + 1) != ']') {
+          copy(1)
+          val hi = classMember()
+          if (lo.codePoint < 0 || hi.codePoint < 0) fail("range with a class escape")
+          containsCr |= lo.codePoint <= '\r' && '\r' <= hi.codePoint
+        } else {
+          containsCr |= lo.matchesCr
         }
       }
       if (i >= p.length) fail("unterminated character class")
       copy(1)
+      containsCr != negated
     }
 
     /** A group starting at `i`. */
@@ -321,6 +448,7 @@ object Re2PatternUtils {
 
     private def openGroup(): Unit = {
       enclosingDotAll = dotAll :: enclosingDotAll
+      tokens.append('(')
     }
 
     /** `(?flags)` or `(?flags:...)` at `i`. Only the `s` flag is supported. */

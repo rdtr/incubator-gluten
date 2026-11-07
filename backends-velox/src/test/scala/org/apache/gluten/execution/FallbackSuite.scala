@@ -405,7 +405,7 @@ class FallbackSuite extends VeloxWholeStageTransformerSuite with AdaptiveSparkPl
             fallbackReasons.exists(
               r =>
                 r.contains("regexp_extract due to Pattern") ||
-                  r.contains("uses constructs (lookahead/lookbehind/backreference)")),
+                  r.contains("lookaround has no RE2 equivalent")),
             s"Unexpected fallback reasons: $fallbackReasons"
           )
       }
@@ -422,7 +422,7 @@ class FallbackSuite extends VeloxWholeStageTransformerSuite with AdaptiveSparkPl
                              |select tmp1.c1, tmp1.c2 from tmp1
                              |left join tmp2
                              |on tmp1.c1 = tmp2.c1
-                             |and tmp1.c2 not rlike '^[\\u4e00-\\u9fa5]{2,10}[0-9]+$'
+                             |and tmp1.c2 not rlike '^[\\u4e00-\\u9fa5]{2,10}[0-9]+'
                              |""".stripMargin)
         df.collect()
         GlutenSuiteUtils.waitUntilEmpty(spark.sparkContext)

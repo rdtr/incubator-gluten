@@ -824,6 +824,98 @@ class ScalarFunctionsValidateSuite extends FunctionsValidateSuite {
     }
   }
 
+  test("regex patterns that RE2 reads differently from java.util.regex") {
+    withTempPath {
+      path =>
+        // scalastyle:off nonascii
+        Seq(
+          "a\rb",
+          "a\nb",
+          "a\r\nb",
+          "a\u0085b",
+          "a\u2028b",
+          "a\u2029b",
+          "a\u000Bb",
+          "a\tb",
+          "a b",
+          "a.b",
+          "a$b",
+          "ab",
+          "ab\n",
+          "ab\r\n",
+          "Äb",
+          "éb",
+          "A",
+          null
+        ).toDF("s")
+          .write
+          .parquet(path.getCanonicalPath)
+        // scalastyle:on nonascii
+        spark.read.parquet(path.getCanonicalPath).createOrReplaceTempView("regex_tbl")
+
+        def lit(pattern: String): String =
+          "'" + pattern.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        def checkOffloaded(expr: String): Unit =
+          runQueryAndCompare(s"SELECT s, $expr FROM regex_tbl") {
+            checkGlutenPlan[ProjectExecTransformer]
+          }
+        def checkFallback(expr: String): Unit =
+          runQueryAndCompare(s"SELECT s, $expr FROM regex_tbl", noFallBack = false) {
+            df =>
+              checkSparkPlan[ProjectExec](df)
+              assert(fallbackReasons(df).exists(_.contains("cannot be translated to RE2")))
+          }
+
+        // Java's `.` excludes \r, U+0085, U+2028 and U+2029 as well as \n.
+        checkOffloaded(s"rlike(s, ${lit("a.b")})")
+        checkOffloaded(s"regexp_replace(s, ${lit(".")}, 'x')")
+        checkOffloaded(s"regexp_extract(s, ${lit("(a.)b")}, 1)")
+        checkOffloaded(s"regexp_extract_all(s, ${lit("(.)")}, 1)")
+        checkOffloaded(s"regexp_instr(s, ${lit("[^a].")})")
+        checkOffloaded(s"split(s, ${lit("a.")})")
+        // With DOTALL, `.` matches everything in both engines.
+        checkOffloaded(s"rlike(s, ${lit("(?s)a.b")})")
+        checkOffloaded(s"regexp_replace(s, ${lit("(?s:.)")}, 'x')")
+        // Java's `\s` includes the vertical tab.
+        checkOffloaded(s"rlike(s, ${lit("a\\sb")})")
+        checkOffloaded(s"regexp_replace(s, ${lit("\\s")}, '_')")
+        checkOffloaded(s"regexp_replace(s, ${lit("\\S")}, '_')")
+        checkOffloaded(s"regexp_replace(s, ${lit("[\\s.]")}, '_')")
+        checkOffloaded(s"regexp_replace(s, ${lit("[^\\s]")}, '_')")
+        checkOffloaded(s"split(s, ${lit("\\s")})")
+        // `.` and `$` inside a class or escaped are literals.
+        checkOffloaded(s"rlike(s, ${lit("a[.]b")})")
+        checkOffloaded(s"rlike(s, ${lit("a\\.b")})")
+        checkOffloaded(s"rlike(s, ${lit("a[$]")})")
+        checkOffloaded(s"rlike(s, ${lit("a\\$")})")
+        checkOffloaded(s"rlike(s, ${lit("\\Qa.b\\E")})")
+
+        // `$` also matches before a final line terminator in Java.
+        checkFallback(s"rlike(s, ${lit("b$")})")
+        checkFallback(s"regexp_replace(s, ${lit("b$")}, 'X')")
+        checkFallback(s"regexp_extract(s, ${lit("(b)$")}, 1)")
+        // Inline flags that mean something else in RE2.
+        checkFallback(s"rlike(s, ${lit("(?m)^b")})")
+        // scalastyle:off nonascii
+        checkFallback(s"rlike(s, ${lit("(?i)ä")})")
+        // scalastyle:on nonascii
+        checkFallback(s"regexp_extract(s, ${lit("(?U)(\\w+)")}, 1)")
+        // Escapes that mean something else in RE2.
+        checkFallback(s"rlike(s, ${lit("a\\vb")})")
+        checkFallback(s"rlike(s, ${lit("\\101")})")
+        checkFallback(s"rlike(s, ${lit("\\bb")})")
+
+        // Patterns that java.util.regex rejects and RE2 accepts must fail as in Spark.
+        Seq("a{", "x{foo}", "\\p{Latin}").foreach {
+          pattern =>
+            val e = intercept[Exception] {
+              spark.sql(s"SELECT rlike(s, ${lit(pattern)}) FROM regex_tbl").collect()
+            }
+            assert(e.getMessage.contains(pattern), e.getMessage)
+        }
+    }
+  }
+
   testWithMinSparkVersion("dayname", "4.0") {
     runQueryAndCompare("SELECT dayname(l_shipdate) FROM lineitem limit 50") {
       checkGlutenPlan[ProjectExecTransformer]

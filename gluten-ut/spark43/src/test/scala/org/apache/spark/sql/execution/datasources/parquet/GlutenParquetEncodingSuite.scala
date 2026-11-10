@@ -16,8 +16,16 @@
  */
 package org.apache.spark.sql.execution.datasources.parquet
 
+import org.apache.gluten.config.GlutenConfig
+
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.GlutenSQLTestsBaseTrait
 
 // TODO: this needs a lot more testing but it's currently not easy to test with the parquet
 // writer abstractions. Revisit.
-class GlutenParquetEncodingSuite extends ParquetEncodingSuite with GlutenSQLTestsBaseTrait {}
+class GlutenParquetEncodingSuite extends ParquetEncodingSuite with GlutenSQLTestsBaseTrait {
+  // The tests read back the encodings parquet-mr writes, e.g. BYTE_STREAM_SPLIT, which the
+  // native writer does not write. The reads still run in Velox.
+  override def sparkConf: SparkConf =
+    super.sparkConf.set(GlutenConfig.NATIVE_WRITER_ENABLED.key, "false")
+}

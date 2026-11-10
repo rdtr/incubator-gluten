@@ -890,47 +890,24 @@ class VeloxTestSettings extends BackendTestSettings {
   enableSuite[GlutenOrcV1SchemaPruningSuite]
   enableSuite[GlutenOrcV2SchemaPruningSuite]
   enableSuite[GlutenParquetColumnIndexSuite]
-    .exclude("reading from unaligned pages - test filters") // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "test reading unaligned pages - test all types"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "test reading unaligned pages - test all types (Parquet v2 writer)"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "test reading unaligned pages - test all types (dict encode)"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "test reading unaligned pages - test all types (dict encode, Parquet v2 writer)"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "SPARK-36123: reading from unaligned pages - test filters with nulls"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "reading from unaligned pages - test filters with nulls (Parquet v2 writer)"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude("reading unaligned pages - struct type") // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "reading unaligned pages - struct type (Parquet v2 writer)"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "SPARK-59831: reading unaligned pages - BYTE_STREAM_SPLIT"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
+    // Velox reader: DELTA_BYTE_ARRAY on FIXED_LEN_BYTE_ARRAY is not supported
+    .exclude("test reading unaligned pages - test all types (Parquet v2 writer)")
+    // Velox reader: DELTA_BYTE_ARRAY on FIXED_LEN_BYTE_ARRAY is not supported
+    .exclude("test reading unaligned pages - test all types (dict encode, Parquet v2 writer)")
+    // Velox reader: DELTA_BYTE_ARRAY on FIXED_LEN_BYTE_ARRAY is not supported
+    .exclude("SPARK-59828: reading unaligned pages - FIXED_LEN_BYTE_ARRAY with DELTA_BYTE_ARRAY")
+    // Velox reader: nested columns with DATA_PAGE_V2 fail in PageReader::preloadRepDefs
+    .exclude("reading unaligned pages - struct type (Parquet v2 writer)")
   enableSuite[GlutenParquetCompressionCodecPrecedenceSuite]
   enableSuite[GlutenParquetDeltaByteArrayEncodingSuite]
   enableSuite[GlutenParquetDeltaEncodingInteger]
   enableSuite[GlutenParquetDeltaEncodingLong]
   enableSuite[GlutenParquetDeltaLengthByteArrayEncodingSuite]
   enableSuite[GlutenParquetEncodingSuite]
-    .exclude(
-      "BYTE_STREAM_SPLIT encoding round-trip for float and double columns"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "BYTE_STREAM_SPLIT encoding round-trip for all supported types"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "SPARK-59831: BYTE_STREAM_SPLIT round-trip with v1 and v2 pages, nulls and arrays"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
+    // Velox reader: BYTE_STREAM_SPLIT supports only FLOAT and DOUBLE
+    .exclude("BYTE_STREAM_SPLIT encoding round-trip for all supported types")
+    // Velox reader: BYTE_STREAM_SPLIT supports only FLOAT and DOUBLE
+    .exclude("SPARK-59831: BYTE_STREAM_SPLIT round-trip with v1 and v2 pages, nulls and arrays")
   enableSuite[GlutenParquetFieldIdIOSuite]
   enableSuite[GlutenParquetFileFormatV1Suite]
   enableSuite[GlutenParquetFileFormatV2Suite]
@@ -970,15 +947,10 @@ class VeloxTestSettings extends BackendTestSettings {
     // Disabled because Velox does not implement Spark's legacy Impala INT96 timestamp conversion semantics.
     .exclude("parquet timestamp conversion")
   enableSuite[GlutenParquetIOSuite]
-    .exclude(
-      "SPARK-59832: vectorized reader fails on truncated definition levels"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "SPARK-59832: invalid definition level length reports the column"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
-    .exclude(
-      "SPARK-59832: invalid length of RLE booleans in a V2 page reports the column"
-    ) // GLUTEN-13517 Spark 4.3 UT enablement
+    // Error type: Velox reports corrupted pages with its own error. Rewritten with testGluten.
+    .exclude("SPARK-59832: vectorized reader fails on truncated definition levels")
+    .exclude("SPARK-59832: invalid definition level length reports the column")
+    .exclude("SPARK-59832: invalid length of RLE booleans in a V2 page reports the column")
     // Velox doesn't write file metadata into parquet file.
     .exclude("Write Spark version into Parquet metadata")
     // Exception.

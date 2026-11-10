@@ -16,9 +16,18 @@
  */
 package org.apache.spark.sql.execution.datasources.parquet
 
+import org.apache.gluten.config.GlutenConfig
+
+import org.apache.spark.SparkException
 import org.apache.spark.sql._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, BooleanType, IntegerType, LongType, StringType, StructType}
+
+import org.apache.commons.lang3.exception.ExceptionUtils
+import org.apache.parquet.bytes.BytesUtils
+import org.apache.parquet.hadoop.ParquetOutputFormat
+
+import java.nio.file.Files
 
 import scala.jdk.CollectionConverters._
 
@@ -114,5 +123,71 @@ class GlutenParquetIOSuite extends ParquetIOSuite with GlutenSQLTestsBaseTrait {
           }
         }
     }
+  }
+
+  /**
+   * Like `ParquetIOSuite.readCorruptedRleSection`: writes 100 rows of `column` to a single
+   * uncompressed data page, lets `corrupt` modify the RLE section that starts with
+   * `03 00 00 00 C8 01 01` and returns the error of reading the file. The file is written by
+   * parquet-mr, since the native writer ignores `PARQUET_2_0` and writes every column as optional.
+   */
+  private def readCorruptedRleSectionWithVelox(
+      column: String,
+      writerVersion: String = "PARQUET_1_0")(corrupt: (Array[Byte], Int) => Unit): Throwable = {
+    var error: Throwable = null
+    withTempPath {
+      dir =>
+        val path = dir.getCanonicalPath
+        withSQLConf(GlutenConfig.NATIVE_WRITER_ENABLED.key -> "false") {
+          spark
+            .range(100)
+            .selectExpr(column)
+            .coalesce(1)
+            .write
+            .option(ParquetOutputFormat.ENABLE_DICTIONARY, "false")
+            .option(ParquetOutputFormat.WRITER_VERSION, writerVersion)
+            .option("compression", "uncompressed")
+            .parquet(path)
+        }
+        val file = dir.listFiles().filter(_.getName.endsWith(".parquet")).head
+        val bytes = Files.readAllBytes(file.toPath)
+        val section = Array[Byte](3, 0, 0, 0, 0xc8.toByte, 0x01, 1)
+        val offset = bytes.indexOfSlice(section)
+        assert(offset >= 0 && bytes.indexOfSlice(section, offset + 1) < 0)
+        corrupt(bytes, offset)
+        Files.write(file.toPath, bytes)
+        dir.listFiles().filter(_.getName.endsWith(".crc")).foreach(_.delete())
+        error = intercept[SparkException](spark.read.parquet(path).collect())
+    }
+    error
+  }
+
+  private def setMaxLength(bytes: Array[Byte], offset: Int): Unit =
+    BytesUtils.intToBytes(Int.MaxValue).copyToArray(bytes, offset)
+
+  /** Checks that the read failed with the Velox error about the corrupted page. */
+  private def assertVeloxReadError(e: Throwable, message: String): Unit = {
+    val messages = ExceptionUtils.getThrowableList(e).asScala.flatMap(c => Option(c.getMessage))
+    assert(messages.exists(_.contains(message)), e)
+  }
+
+  // The Spark tests check the error of the vanilla vectorized reader. Velox reports the
+  // corrupted page with its own error; what matters is that the read fails.
+  testGluten("SPARK-59832: reading truncated definition levels fails") {
+    val e = readCorruptedRleSectionWithVelox("if(id < 0, null, cast(id as int)) as a") {
+      (bytes, offset) => bytes(offset + 4) = 0x80.toByte
+    }
+    assertVeloxReadError(e, "Invalid varint value: too few bytes")
+  }
+
+  testGluten("SPARK-59832: reading an invalid definition level length fails") {
+    val e = readCorruptedRleSectionWithVelox("if(id < 0, null, cast(id as int)) as a")(setMaxLength)
+    assertVeloxReadError(e, "Definition level length 2147483647 exceeds remaining page size")
+  }
+
+  testGluten("SPARK-59832: reading an invalid length of RLE booleans in a V2 page fails") {
+    val e = readCorruptedRleSectionWithVelox("id >= 0 as b", writerVersion = "PARQUET_2_0")(
+      setMaxLength)
+    assertVeloxReadError(e, "Received invalid number of bytes: 2147483647 (corrupt data page?)")
   }
 }

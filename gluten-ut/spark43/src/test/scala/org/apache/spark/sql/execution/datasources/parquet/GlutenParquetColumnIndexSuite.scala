@@ -16,6 +16,15 @@
  */
 package org.apache.spark.sql.execution.datasources.parquet
 
+import org.apache.gluten.config.GlutenConfig
+
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.GlutenSQLTestsBaseTrait
 
-class GlutenParquetColumnIndexSuite extends ParquetColumnIndexSuite with GlutenSQLTestsBaseTrait {}
+class GlutenParquetColumnIndexSuite extends ParquetColumnIndexSuite with GlutenSQLTestsBaseTrait {
+  // The tests check that the reader handles unaligned pages, so they need parquet-mr to write
+  // the page layout they ask for. The native writer puts the filter column into a single page
+  // (the tests check for more than one page since SPARK-59837). The reads still run in Velox.
+  override def sparkConf: SparkConf =
+    super.sparkConf.set(GlutenConfig.NATIVE_WRITER_ENABLED.key, "false")
+}

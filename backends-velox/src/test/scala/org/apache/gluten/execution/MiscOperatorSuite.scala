@@ -2413,14 +2413,6 @@ class MiscOperatorSuite extends VeloxWholeStageTransformerSuite with AdaptiveSpa
     }
   }
 
-  // Enable the test after fixing https://github.com/apache/gluten/issues/6827
-  ignore("Test round expression") {
-    val df1 = runQueryAndCompare("SELECT round(cast(0.5549999999999999 as double), 2)") { _ => }
-    checkLengthAndPlan(df1, 1)
-    val df2 = runQueryAndCompare("SELECT round(cast(0.19324999999999998 as double), 2)") { _ => }
-    checkLengthAndPlan(df2, 1)
-  }
-
   test("Fix wrong rescale") {
     withTable("t") {
       sql("create table t (col0 decimal(10, 0), col1 decimal(10, 0)) using parquet")

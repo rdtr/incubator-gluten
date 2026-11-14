@@ -479,6 +479,66 @@ class MathFunctionsValidateSuite extends FunctionsValidateSuite {
     compareResultsAgainstVanillaSpark("select round(44, -1)", true, { _ => })
   }
 
+  test("round on float and double follows Spark's BigDecimal rounding") {
+    withTempPath {
+      path =>
+        // Spark rounds the shortest decimal form of the double (a float is widened first).
+        // These values are next to a rounding boundary in binary or are large enough that
+        // one ulp is a rounding unit.
+        Seq(
+          0.285,
+          0.575,
+          -0.575,
+          99.995,
+          0.285 * 100,
+          1.005 * 100,
+          0.49999999999999994,
+          0.5549999999999999,
+          0.19324999999999998,
+          3.1415,
+          2.5,
+          -2.5,
+          -0.4,
+          -0.001,
+          5000000.0,
+          16777216.0,
+          70000.0,
+          67950.49,
+          4503599627370496.0,
+          1.7e15,
+          35184372088832.0,
+          1e300,
+          Double.NaN,
+          Double.PositiveInfinity,
+          Double.NegativeInfinity
+        ).toDF("d")
+          .withColumn("f", col("d").cast("float"))
+          .write
+          .parquet(path.getCanonicalPath)
+        spark.read.parquet(path.getCanonicalPath).createOrReplaceTempView("round_input")
+
+        val query =
+          "SELECT d, round(d), round(d, 2), round(d, 10), f, round(f), round(f, 1), round(f, 2)" +
+            " FROM round_input"
+        val df = runQueryAndCompare(query) {
+          checkGlutenPlan[ProjectExecTransformer]
+        }
+        // The default comparison accepts a small difference between doubles and does not tell
+        // 0.0 from -0.0, so compare the bits as well.
+        var expected: Seq[Row] = Seq.empty
+        withSQLConf(vanillaSparkConfs(): _*) {
+          expected = spark.sql(query).collect().toSeq
+        }
+        def bits(row: Row): Seq[Long] = row.toSeq.map {
+          case d: Double => java.lang.Double.doubleToRawLongBits(d)
+          case f: Float => java.lang.Float.floatToRawIntBits(f).toLong
+        }
+        val sortById: Row => Long = row => java.lang.Double.doubleToRawLongBits(row.getDouble(0))
+        assert(
+          df.collect().sortBy(sortById).map(bits).toSeq === expected.sortBy(sortById).map(bits))
+    }
+  }
+
   test("shiftleft") {
     runQueryAndCompare("SELECT shiftleft(int_field1, 1) from datatab limit 1") {
       checkGlutenPlan[ProjectExecTransformer]

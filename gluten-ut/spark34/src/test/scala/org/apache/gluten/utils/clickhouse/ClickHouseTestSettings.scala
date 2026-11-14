@@ -740,7 +740,6 @@ class ClickHouseTestSettings extends BackendTestSettings {
     .exclude("atan2")
     .exclude("binary log")
     .exclude("round/bround/floor/ceil")
-    .excludeGlutenTest("round/bround/floor/ceil")
     // See https://github.com/apache/gluten/issues/7232
     .excludeGlutenTest("unhex returns null for invalid hex input")
     .exclude("SPARK-36922: Support ANSI intervals for SIGN/SIGNUM")

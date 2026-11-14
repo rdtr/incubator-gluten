@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -85,8 +87,26 @@ class SparkFunctionTest : public SparkFunctionBaseTest {
             {-1.129, 1, -1.1},      {-1.129, 2, -1.13},     {-1.129, 2, -1.13},       {-1.0 / 3, 0, 0.0},
             {-1.0 / 3, 1, -0.3},    {-1.0 / 3, 2, -0.33},   {-1.0 / 3, 6, -0.333333}, {1.0, -1, 0.0},
             {0.0, -2, 0.0},         {-1.0, -3, 0.0},        {11111.0, -1, 11110.0},   {11111.0, -2, 11100.0},
-            {11111.0, -3, 11000.0}, {11111.0, -4, 10000.0}, {0.575, 2, 0.58},         {0.574, 2, 0.57},
-            {-0.575, 2, -0.58},     {-0.574, 2, -0.57}};
+            {11111.0, -3, 11000.0}, {11111.0, -4, 10000.0}, {0.574, 2, 0.57},         {-0.574, 2, -0.57}};
+  }
+
+  // Checks round(c0, c1) against Spark's
+  // BigDecimal.valueOf(c0).setScale(c1, HALF_UP), including the sign of zero.
+  template <typename T>
+  void runRoundFloatingPointTest(const std::vector<std::tuple<T, int32_t, T>>& data) {
+    auto result = evaluate<SimpleVector<T>>(
+        "round(c0, c1)", makeRowVector({makeFlatVector<T, 0>(data), makeFlatVector<int32_t, 1>(data)}));
+    for (int32_t i = 0; i < data.size(); ++i) {
+      const auto [input, decimals, expected] = data[i];
+      SCOPED_TRACE(fmt::format("round({}, {})", input, decimals));
+      const T actual = result->valueAt(i);
+      if (std::isnan(expected)) {
+        ASSERT_TRUE(std::isnan(actual));
+      } else {
+        ASSERT_EQ(actual, expected);
+        ASSERT_EQ(std::signbit(actual), std::signbit(expected));
+      }
+    }
   }
 
   template <typename T>
@@ -123,6 +143,79 @@ TEST_F(SparkFunctionTest, roundWithDecimal) {
   runRoundWithDecimalTest<int32_t>(testRoundWithDecIntegralData<int32_t>());
   runRoundWithDecimalTest<int16_t>(testRoundWithDecIntegralData<int16_t>());
   runRoundWithDecimalTest<int8_t>(testRoundWithDecIntegralData<int8_t>());
+}
+
+// Spark rounds the digits of Double.toString(x), the shortest decimal that
+// reads back as x; a FLOAT is widened to double first.
+TEST_F(SparkFunctionTest, roundDouble) {
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  runRoundFloatingPointTest<double>({
+      // Shortest form 0.285 is a tie, although the double is below it.
+      {0.285, 2, 0.29},
+      {0.575, 2, 0.58},
+      {-0.575, 2, -0.58},
+      {99.995, 2, 100.0},
+      {123456789012.345, 2, 123456789012.35},
+      // One ulp below a tie, from arithmetic (0.285 * 100, 1.005 * 100).
+      {28.499999999999996, 0, 28.0},
+      {100.49999999999999, 0, 100.0},
+      {0.49999999999999994, 0, 0.0},
+      {0.5549999999999999, 2, 0.55},
+      // Exact ties round away from zero.
+      {2.5, 0, 3.0},
+      {-2.5, 0, -3.0},
+      // Large values have no digits to round off.
+      {4503599627370496.0, 0, 4503599627370496.0},
+      {9007199254740992.0, 0, 9007199254740992.0},
+      {1.7e15, 2, 1.7e15},
+      {35184372088832.0, 2, 35184372088832.0},
+      {1e300, 2, 1e300},
+      {1.5, 400, 1.5},
+      {1.0 / 3, 10, 0.3333333333},
+      // Zero has no sign in BigDecimal.
+      {-0.4, 0, 0.0},
+      {-0.001, 2, 0.0},
+      {-0.0, 0, 0.0},
+      // Double.toString(4.9E-324) has two digits, 4.9E-324, not 5E-324.
+      {4.9e-324, 323, 0.0},
+      {kInf, 2, kInf},
+      {-kInf, 2, -kInf},
+      {kNaN, 2, kNaN},
+  });
+}
+
+TEST_F(SparkFunctionTest, roundFloat) {
+  constexpr float kInf = std::numeric_limits<float>::infinity();
+  constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
+  runRoundFloatingPointTest<float>({
+      // The widened float is below the tie: (double) 0.285f = 0.28499999642372131.
+      {0.285f, 2, 0.28f},
+      {0.575f, 2, 0.57f},
+      {-0.575f, 2, -0.57f},
+      {2.675f, 2, 2.67f},
+      {1.005f, 2, 1.0f},
+      {0.35f, 1, 0.3f},
+      {67950.49f, 0, 67950.0f},
+      {1.1f, 1, 1.1f},
+      {99999.99f, 2, 99999.99f},
+      // Exact ties round away from zero.
+      {0.125f, 2, 0.13f},
+      {-0.125f, 2, -0.13f},
+      {2.5f, 0, 3.0f},
+      // Large values have no digits to round off.
+      {5000000.0f, 0, 5000000.0f},
+      {16777216.0f, 0, 16777216.0f},
+      {70000.0f, 2, 70000.0f},
+      {std::numeric_limits<float>::max(), 2, std::numeric_limits<float>::max()},
+      {std::numeric_limits<float>::denorm_min(), 45, std::numeric_limits<float>::denorm_min()},
+      // Zero has no sign in BigDecimal.
+      {-0.4f, 0, 0.0f},
+      {-0.0f, 0, 0.0f},
+      {kInf, 2, kInf},
+      {-kInf, 2, -kInf},
+      {kNaN, 2, kNaN},
+  });
 }
 
 TEST_F(SparkFunctionTest, expressionLevelAnsiCastIgnoresSessionAnsiOff) {

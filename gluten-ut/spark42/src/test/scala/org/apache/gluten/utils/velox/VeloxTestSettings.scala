@@ -228,8 +228,6 @@ class VeloxTestSettings extends BackendTestSettings {
     .exclude("SPARK-37967: Literal.create support ObjectType")
   enableSuite[GlutenTimestampNtzLiteralSuite]
   enableSuite[GlutenMathExpressionsSuite]
-    // Spark round UT for round(3.1415,3) is not correct.
-    .exclude("round/bround/floor/ceil")
   enableSuite[GlutenMiscExpressionsSuite]
   enableSuite[GlutenNondeterministicSuite]
     .exclude("MonotonicallyIncreasingID")
